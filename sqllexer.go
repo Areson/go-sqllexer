@@ -1,6 +1,7 @@
 package sqllexer
 
 import (
+	"fmt"
 	"unicode/utf8"
 )
 
@@ -412,6 +413,11 @@ func (s *Lexer) scanIdentifier(ch rune) *Token {
 	if ch == '(' {
 		return s.emit(FUNCTION)
 	}
+
+	if s.config.DBMS == DBMSMySQL {
+		return s.checkForSpacesInIdentifier(IDENT)
+	}
+
 	return s.emit(IDENT)
 }
 
@@ -462,7 +468,69 @@ func (s *Lexer) scanDoubleQuotedIdentifier(delimiter rune) *Token {
 		ch = s.next()
 	}
 	s.next() // consume the closing quote
+
+	if s.config.DBMS == DBMSMySQL {
+		return s.checkForSpacesInIdentifier(QUOTED_IDENT)
+	}
+
 	return s.emit(QUOTED_IDENT)
+}
+
+// checkForSpacesInIdentifier
+// MySQL can normalize queries (like from digests) and adds spaces before
+// and after the separating dot in qualified identifiers.
+// e.g. SELECT `db` . `table` . `column` FROM ...
+// It can also allow partially quoted identifiers
+// like `foo`.bar or foo.`bar`. So we check for that case here.
+func (s *Lexer) checkForSpacesInIdentifier(tokenType TokenType) *Token {
+	if s.config.DBMS != DBMSMySQL {
+		return s.emit(tokenType)
+	}
+
+	token := s.emit(tokenType)
+	tokenValue := token.Value
+	ch := s.peek()
+	lastPos := s.cursor
+
+	for isSpace(ch) {
+		ch = s.next()
+	}
+	if ch == '.' {
+		ch = s.next() // consume the dot
+		for isSpace(ch) {
+			ch = s.next()
+		}
+
+		var scanFn func(rune) *Token
+		if isAlphaNumeric(ch) {
+			scanFn = s.scanIdentifier
+		} else if ch == '`' {
+			scanFn = func(r rune) *Token {
+				return s.scanDoubleQuotedIdentifier('`')
+			}
+		}
+
+		if scanFn != nil {
+			// Throw away the white space and dot
+			s.emit(UNKNOWN)
+			secondHalf := scanFn(ch)
+			// Combine the two identifier parts
+			combinedValue := fmt.Sprintf("%s.%s", tokenValue, secondHalf.Value)
+
+			if tokenType == QUOTED_IDENT || secondHalf.Type == QUOTED_IDENT {
+				tokenType = QUOTED_IDENT
+			}
+			return &Token{
+				Type:           tokenType,
+				Value:          combinedValue,
+				lastValueToken: secondHalf.lastValueToken,
+			}
+		}
+	}
+
+	// reset cursor if no dot found
+	s.cursor = lastPos
+	return token
 }
 
 func (s *Lexer) scanWhitespace() *Token {
